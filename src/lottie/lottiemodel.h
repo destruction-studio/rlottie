@@ -989,7 +989,19 @@ public:
     LOTRepeaterData():LOTData(LOTData::Type::Repeater){}
     LOTShapeGroupData *content() const { return mContent ? mContent.get() : nullptr; }
     void setContent(std::shared_ptr<LOTShapeGroupData> content) {mContent = std::move(content);}
-    int maxCopies() const { return int(mMaxCopies);}
+    // TG-FIX: mMaxCopies comes from the animation file, and converting a
+    // non-finite or out-of-range float to int is undefined behaviour — which
+    // happens BEFORE any downstream cap can look at the value. Clamp first.
+    int maxCopies() const { return clampedCopyCount(mMaxCopies); }
+    static int clampedCopyCount(float value)
+    {
+        // Deliberately generous: this is only about keeping the conversion
+        // defined, the actual memory limits live in lottieitem.cpp.
+        const int kMaxCopies = 100000;
+        if (!std::isfinite(value) || value <= 0.0f) return 0;
+        if (value > float(kMaxCopies)) return kMaxCopies;
+        return int(value);
+    }
     float copies(int frameNo) const {return mCopies.value(frameNo);}
     float offset(int frameNo) const {return mOffset.value(frameNo);}
 public:

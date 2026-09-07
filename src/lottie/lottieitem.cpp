@@ -79,10 +79,69 @@ static bool isGoodParentLayer(LOTLayerItem *parent, LOTLayerItem *child) {
     return true;
 }
 
+// TG-FIX: budget for repeater copies, shared by the whole composition tree.
+// A per-repeater cap is not enough on its own: repeaters nest, and their copy
+// counts multiply, so three nested repeaters of a thousand each pass every
+// individual check and still ask for a billion content groups. The budget is
+// reset in the LOTCompItem constructor because that is what builds the entire
+// tree. It is thread_local because compositions are built on render threads and
+// several can be under construction at once — a shared counter would let one
+// animation eat another's budget.
+static thread_local int sRepeaterCopyBudget = 0;
+
+// TG-FIX: copies and points are bounded above, but the number of content ITEMS
+// is copies * shapes-in-group, and every item carries its own vectors and
+// rasterizer — a group of a thousand shapes repeated a thousand times is a
+// million objects before a single point is allocated. This budget counts items
+// as they are created; addChildren already tolerates a null item, so an
+// exhausted budget simply stops adding children. Reset alongside the copy
+// budget, for the same reason and with the same thread_local caveat.
+static thread_local int sContentItemBudget = 0;
+static const int kContentItemBudgetPerComposition = 100000;
+
+// TG-FIX: a cap on copies alone does not bound memory, because one repeater
+// copy rebuilds every shape inside its group: ten rounded stars of 4000 points
+// each, repeated a thousand times, still reserve gigabytes of coordinates. So
+// the real budget is counted in PATH POINTS and is reset every frame in
+// LOTCompItem::update — per frame rather than per composition, because paths
+// are rebuilt on each update and a per-composition budget would run out and
+// make shapes disappear after a few frames.
+static thread_local int sPathPointBudget = 0;
+
+// A shape keeps three paths alive at once (local, final, and the paint
+// element's own), so the peak is a few times the raw coordinate count. 400k
+// points is roughly 3 MB of coordinates and about 10 MB with all three paths —
+// which the notification extension can afford under its ~24 MB jetsam limit,
+// and this renderer is linked into that extension as well, with no per-target
+// build flag to tell them apart. Real stickers use thousands of points, so the
+// budget still sits about two orders of magnitude above anything that renders.
+static const int kPathPointBudgetPerFrame = 400000;
+
+// Exact reservation made by VPath for one star/polygon, mirroring vpath.cpp:
+// a star walks ceil(points) * 2 vertices, a polygon floor(points); without
+// roundness the path reserves N + 2 points, with roundness 3N + 2. Charging
+// the rounded-star worst case to everything (an earlier version did) starved
+// cheap polygons of budget and, since a static path is built once, made them
+// vanish for good — so the cost has to be the real one.
+static int polystarPointCost(float points, bool isStar, bool hasRoundness)
+{
+    // Same acceptance window as isPolyPointCountUsable() in vpath.cpp: outside
+    // it VPath returns without reserving anything, so charging the budget for
+    // such a shape would starve a valid one that comes later. The range check
+    // also keeps every conversion below defined — no huge float ever reaches
+    // ceil/floor or the multiplication.
+    const float MAX_COSTED_POINTS = 4000.0f;
+    if (!std::isfinite(points) || points < 1.0f || points > MAX_COSTED_POINTS) return 0;
+    const int n = isStar ? int(std::ceil(points)) * 2 : int(std::floor(points));
+    return (hasRoundness ? n * 3 : n) + 2;
+}
+
 LOTCompItem::LOTCompItem(LOTModel *model)
     : mCurFrameNo(-1)
 {
     mCompData = model->mRoot.get();
+    sRepeaterCopyBudget = 1000;
+    sContentItemBudget = kContentItemBudgetPerComposition;
     mRootLayer = createLayerItem(mCompData->mRootLayer.get());
     mRootLayer->setComplexContent(false);
     mViewSize = mCompData->size();
@@ -129,6 +188,7 @@ bool LOTCompItem::update(int frameNo, const VSize &size, bool keepAspectRatio)
     mViewSize = size;
     mCurFrameNo = frameNo;
     mKeepAspectRatio = keepAspectRatio;
+    sPathPointBudget = kPathPointBudgetPerFrame;
 
     /*
      * if viewbox dosen't scale exactly to the viewport
@@ -1036,6 +1096,10 @@ void LOTContentGroupItem::addChildren(LOTGroupData *data)
     if (!data) return;
 
     for (auto &i : data->mChildren) {
+        if (sContentItemBudget <= 0) {
+            break;
+        }
+        sContentItemBudget--;
         auto content = LOTShapeLayerItem::createContentItem(i.get());
         if (content) {
             content->setParent(this);
@@ -1263,6 +1327,20 @@ void LOTPolystarItem::updatePath(VPath &path, int frameNo)
 
     path.reset();
     VMatrix m;
+
+    // Charge this shape to the frame's point budget; when it is exhausted the
+    // shape is skipped and the rest of the animation still renders.
+    // vpath.cpp divides the roundness by 100 BEFORE its vIsZero() test, so the
+    // same scale is used here — otherwise a roundness that VPath treats as zero
+    // would be priced as the rounded (3x) variant.
+    const bool isStar = (mData->mPolyType == LOTPolystarData::PolyType::Star);
+    const bool hasRoundness = isStar ? !(vIsZero(innerRoundness / 100.0f) && vIsZero(outerRoundness / 100.0f))
+                                     : !vIsZero(outerRoundness / 100.0f);
+    const int pointCost = polystarPointCost(points, isStar, hasRoundness);
+    if (pointCost > sPathPointBudget) {
+        return;
+    }
+    sPathPointBudget -= pointCost;
 
     if (mData->mPolyType == LOTPolystarData::PolyType::Star) {
         path.addPolystar(points, innerRadius, outerRadius, innerRoundness,
@@ -1551,6 +1629,26 @@ LOTRepeaterItem::LOTRepeaterItem(LOTRepeaterData *data) : mRepeaterData(data)
 
     mCopies = mRepeaterData->maxCopies();
 
+    // TG-FIX: maxCopies comes straight from the animation file and used to be
+    // unbounded, so a malformed asset could ask for as many content groups as it
+    // liked. That does not abort like the polystar overflow did — it just grows
+    // memory until the system kills the process, which is why it shows up as a
+    // termination rather than a crash. Same reasoning as the vertex cap in
+    // vpath.cpp: the bound is about memory, not about validity.
+    const int MAX_REPEATER_COPIES = 1000;
+    if (mCopies < 0) {
+        mCopies = 0;
+    } else if (mCopies > MAX_REPEATER_COPIES) {
+        mCopies = MAX_REPEATER_COPIES;
+    }
+
+    // Take the copies out of the composition-wide budget, so nested repeaters
+    // cannot multiply their way past the per-repeater cap (see LOTCompItem).
+    if (mCopies > sRepeaterCopyBudget) {
+        mCopies = sRepeaterCopyBudget < 0 ? 0 : sRepeaterCopyBudget;
+    }
+    sRepeaterCopyBudget -= mCopies;
+
     for (int i = 0; i < mCopies; i++) {
         auto content =
             std::make_unique<LOTContentGroupItem>(mRepeaterData->content());
@@ -1565,7 +1663,9 @@ void LOTRepeaterItem::update(int frameNo, const VMatrix &parentMatrix,
     DirtyFlag newFlag = flag;
 
     float copies = mRepeaterData->copies(frameNo);
-    int   visibleCopies = int(copies);
+    // TG-FIX: same undefined conversion as in maxCopies() — copies() is animated
+    // per frame, so the raw float reaches int() here on every update.
+    int   visibleCopies = LOTRepeaterData::clampedCopyCount(copies);
 
     if (visibleCopies == 0) {
         mHidden = true;
