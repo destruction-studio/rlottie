@@ -509,21 +509,23 @@ static VPointF curvesForArc(const VRectF &rect, float startAngle,
     return startPoint;
 }
 
-// TG-FIX: shared sanity check for the vertex count of star/polygon shapes.
-// Both bounds are written as positive comparisons on purpose: NaN compares
-// false against everything, so it fails them and is rejected too.
-static bool isPolyPointCountUsable(float points)
+/*
+ * The point count of a polystar/polygon comes straight from the animation data
+ * and is used both as an allocation size and as a loop bound. A NaN, an
+ * infinity or a value such as 1e38 makes the float -> size_t conversion of the
+ * vertex count undefined (it saturates to SIZE_MAX here), after which reserve()
+ * either throws std::length_error or, when the count wraps back to a small
+ * number, the vertex loop runs ~SIZE_MAX times and exhausts memory. Reject the
+ * counts that cannot describe a shape and cap the rest well above anything a
+ * real design uses, while staying cheap to rasterize.
+ */
+static constexpr float POLYSTAR_MAX_POINTS = 1000.0f;
+
+static bool clampPolystarPointCount(float &points)
 {
-    // The upper bound is a memory bound, not a validity judgement. It is chosen
-    // from the WORST CASE rather than from the shape alone: a repeater builds up
-    // to a thousand copies (see the budget in lottieitem.cpp) and every copy
-    // builds its own path, so the cost is copies * points * 3 * sizeof(VPointF).
-    // At 4000 that worst case stays around 96 MB; at 100000 it reached several
-    // gigabytes, which is the same out-of-memory kill the cap exists to prevent.
-    // Real assets use single- or double-digit vertex counts, so this is still
-    // roughly forty times more than anything that renders today.
-    const static float MAX_POLY_POINTS = 4000.0f;
-    return (points >= 1.0f) && (points <= MAX_POLY_POINTS);
+    if (!(points >= 1.0f)) return false;  // also rejects NaN
+    if (points > POLYSTAR_MAX_POINTS) points = POLYSTAR_MAX_POINTS;
+    return true;
 }
 
 void VPath::VPathData::addPolystar(float points, float innerRadius,
@@ -531,12 +533,7 @@ void VPath::VPathData::addPolystar(float points, float innerRadius,
                                    float outerRoundness, float startAngle,
                                    float cx, float cy, VPath::Direction dir)
 {
-    // TG-FIX: `points` is animation-file data and reaches an unchecked
-    // float -> size_t conversion below (numPoints = ceilf(points) * 2, then
-    // reserve(numPoints * 3 + 2)). NaN, inf or an absurd value asked for a
-    // vector past max_size() and aborted the process inside std::vector.
-    // Reject such a shape instead: the rest of the animation still renders.
-    if (!isPolyPointCountUsable(points)) return;
+    if (!clampPolystarPointCount(points)) return;
 
     const static float POLYSTAR_MAGIC_NUMBER = 0.47829f / 0.28f;
     float              currentAngle = (startAngle - 90.0f) * K_PI / 180.0f;
@@ -642,10 +639,7 @@ void VPath::VPathData::addPolygon(float points, float radius, float roundness,
                                   float startAngle, float cx, float cy,
                                   VPath::Direction dir)
 {
-    // TG-FIX: same unchecked conversion as in addPolystar, plus anglePerPoint
-    // divides by floorf(points) — a zero or non-finite count produced inf/NaN
-    // geometry on top of the oversized allocation.
-    if (!isPolyPointCountUsable(points)) return;
+    if (!clampPolystarPointCount(points)) return;
 
     // TODO: Need to support floating point number for number of points
     const static float POLYGON_MAGIC_NUMBER = 0.25;

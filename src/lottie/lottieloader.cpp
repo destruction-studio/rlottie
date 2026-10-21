@@ -71,7 +71,7 @@ private:
 
     std::unordered_map<std::string, std::shared_ptr<LOTModel>>  mHash;
     std::mutex                                                  mMutex;
-    size_t                                                      mcacheSize{10};
+    size_t                                                      mcacheSize{10000};
 };
 
 #else
@@ -148,7 +148,8 @@ bool LottieLoader::loadFromData(
 {
     if (cachePolicy) {
         mModel = LottieModelCache::instance().find(key);
-        if (mModel) return true;
+        if (mModel)
+            return true;
     }
 
     LottieParser parser(const_cast<char *>(jsonData.c_str()),

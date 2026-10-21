@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2018 Samsung Electronics Co., Ltd. All rights reserved.
  *
  * This library is free software; you can redistribute it and/or
@@ -151,6 +151,7 @@ void LOTCompItem::setValue(const std::string &keypath, LOTVariant &value)
 {
     LOTKeyPath key(keypath);
     mRootLayer->resolveKeyPath(key, 0, value);
+    mCurFrameNo = -1;
 }
 
 std::unique_ptr<LOTLayerItem> LOTCompItem::createLayerItem(
